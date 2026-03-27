@@ -2,6 +2,8 @@ use std::{fs};
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::time::{UNIX_EPOCH};
+use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use arrayvec::ArrayVec;
 use filesize::PathExt;
@@ -37,6 +39,8 @@ const DRIVE_REMOTE: u32 = 4;
 const DRIVE_CDROM: u32 = 5;
 #[cfg(windows)]
 const DRIVE_RAMDISK: u32 = 6;
+#[cfg(windows)]
+const PROGRESS_LOG_INTERVAL_SECS: u64 = 4;
 
 use crate::{ScanConfig, GenMatch, HashIOCCollections, FalsePositiveHashCollections, ExtVars, YaraMatch, FilenameIOC, find_hash_ioc};
 use crate::helpers::score::calculate_weighted_score;
@@ -458,6 +462,39 @@ impl ScanModule for FileScanModule {
     }
 }
 
+
+
+fn maybe_log_progress(
+    logger: &UnifiedLogger,
+    scan_state: Option<&Arc<ScanState>>,
+    last_progress_log: &AtomicU64,
+) {
+    let Some(state) = scan_state else { return; };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let last = last_progress_log.load(Ordering::Relaxed);
+
+    if now.saturating_sub(last) >= PROGRESS_LOG_INTERVAL_SECS {
+        if last_progress_log
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            logger.info(&format!(
+                "Progress - Files scanned: {} Alerts: {} Warnings: {} Notices: {} Errors: {}",
+                state.files_scanned.load(Ordering::Relaxed),
+                state.alerts.load(Ordering::Relaxed),
+                state.warnings.load(Ordering::Relaxed),
+                state.notices.load(Ordering::Relaxed),
+                state.errors.load(Ordering::Relaxed),
+            ));
+        }
+    }
+}
+
 // Scan a given file system path
 pub fn scan_path (
     target_folder: &str,
@@ -507,6 +544,7 @@ pub fn scan_path (
         .into_iter();
         
     let scan_state_ref = scan_state.cloned();
+	let last_progress_log = Arc::new(AtomicU64::new(0));
 
     // Process files in parallel
     let (files_scanned, files_matched, alert_count, warning_count, notice_count) = walk.par_bridge()
@@ -525,6 +563,7 @@ pub fn scan_path (
                         logger,
                         scan_state_ref.as_ref()
                     );
+					maybe_log_progress(logger, scan_state_ref.as_ref(), &last_progress_log);
                     // Use dynamic CPU limit from ScanState if available
                     let current_cpu_limit = scan_state_ref.as_ref()
                         .map(|s| s.get_cpu_limit())
